@@ -384,6 +384,24 @@ async def handle_text(m: Message):
         except Exception:
             pass
 
+async def health_server():
+    """Міні-вебсервер для безкоштовного хостингу (Render Web Service + UptimeRobot пінгують /health і не дають заснути)."""
+    from aiohttp import web
+
+    async def ok(request):
+        return web.json_response({"status": "ok"})
+
+    app = web.Application()
+    app.router.add_get("/", ok)
+    app.router.add_get("/health", ok)
+    port = int(os.getenv("PORT", "10000"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"health server on port {port}")
+    await asyncio.Event().wait()
+
 async def main():
     if not BOT_TOKEN or "ABC-DEF" in BOT_TOKEN:
         print("[ERROR] Vstav sviy BOT_TOKEN u file .env (divis .env.example)")
@@ -392,7 +410,8 @@ async def main():
     bot = Bot(token=BOT_TOKEN)
     has_gemini = "yes" if GEMINI_API_KEY else "no (text only via Pollinations)"
     print(f"[OK] Bot zapushcheno! Gemini: {has_gemini}")
-    await dp.start_polling(bot)
+    # поллінг Telegram + health-сервер одночасно (для Render Free)
+    await asyncio.gather(dp.start_polling(bot), health_server())
 
 if __name__ == "__main__":
     asyncio.run(main())
