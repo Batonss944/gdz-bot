@@ -30,7 +30,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
 
 logging.basicConfig(level=logging.INFO)
@@ -187,7 +187,7 @@ def build_prompt(task_text: str, subject: str) -> str:
     return f"{SYSTEM_PROMPT}\n\nПредмет: {subject}\nЗавдання: {task_text}"
 
 # --- AI: Gemini (основний, безкоштовний, новий SDK) ---
-GEMINI_FALLBACK_MODELS = ["gemini-2.0-flash", "gemini-flash-latest"]
+GEMINI_FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-flash-latest"]
 
 def _gemini_retryable(err: Exception) -> bool:
     """True — стоит повторить (перегрузка/таймаут). False — бессмысленно (нет модели, плохой ключ)."""
