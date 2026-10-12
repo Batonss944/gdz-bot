@@ -189,14 +189,6 @@ def build_prompt(task_text: str, subject: str) -> str:
 # --- AI: Gemini (основний, безкоштовний, новий SDK) ---
 GEMINI_FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-flash-latest"]
 
-def _gemini_retryable(err: Exception) -> bool:
-    """True — стоит повторить (перегрузка/таймаут). False — бессмысленно (нет модели, плохой ключ)."""
-    s = f"{type(err).__name__}: {err}".lower()
-    fatal_marks = ("404", "not_found", "not found", "invalid_argument", "invalid model", "api key", "permission", "unauthenticated")
-    if any(m in s for m in fatal_marks):
-        return False
-    return True
-
 async def ask_gemini(prompt: str, image_bytes: bytes | None = None) -> str:
     """Повертає текст відповіді або кидає Exception. При перевантаженні (503) пробує запасні моделі."""
     from google import genai
@@ -208,33 +200,31 @@ async def ask_gemini(prompt: str, image_bytes: bytes | None = None) -> str:
 
     models = [GEMINI_MODEL] + [m for m in GEMINI_FALLBACK_MODELS if m != GEMINI_MODEL]
     last_err: Exception | None = None
+    # По одной попытке на модель: при 503 вторая попытка редко помогает, а секунды тикают.
+    # Шансов и так три (2 модели + Pollinations ниже), поэтому не ждём и не повторяем.
     for model_name in models:
         t0 = time.time()
-        for attempt in range(2):
-            try:
-                if image_bytes:
-                    img_part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
-                    resp = await client.aio.models.generate_content(
-                        model=model_name,
-                        contents=[img_part, prompt],
-                    )
-                else:
-                    resp = await client.aio.models.generate_content(
-                        model=model_name,
-                        contents=prompt,
-                        config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
-                    )
-                text = (resp.text or "").strip()
-                if text:
-                    logger.info(f"Gemini {model_name} OK in {time.time() - t0:.1f}s")
-                    return text
-                raise RuntimeError("empty response")
-            except Exception as e:
-                last_err = e
-                logger.warning(f"Gemini {model_name} attempt {attempt + 1} failed in {time.time() - t0:.1f}s: {e}")
-                if not _gemini_retryable(e):
-                    break  # неверная модель/ключ — не ждём, сразу следующая модель
-                await asyncio.sleep(1)
+        try:
+            if image_bytes:
+                img_part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
+                resp = await client.aio.models.generate_content(
+                    model=model_name,
+                    contents=[img_part, prompt],
+                )
+            else:
+                resp = await client.aio.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+                )
+            text = (resp.text or "").strip()
+            if text:
+                logger.info(f"Gemini {model_name} OK in {time.time() - t0:.1f}s")
+                return text
+            raise RuntimeError("empty response")
+        except Exception as e:
+            last_err = e
+            logger.warning(f"Gemini {model_name} failed in {time.time() - t0:.1f}s: {e}")
     raise last_err or RuntimeError("gemini failed")
 
 # --- AI: Pollinations (запасний, БЕЗ ключа, анонімно) ---
