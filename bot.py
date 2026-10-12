@@ -14,9 +14,11 @@
 import asyncio
 import html
 import io
+import json
 import logging
 import os
 import time
+from datetime import datetime, timezone
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F
@@ -28,7 +30,8 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -55,6 +58,61 @@ def subjects_keyboard() -> ReplyKeyboardMarkup:
 # Запам'ятовуємо вибір предмета + антиспам (в пам'яті, для MVP достатньо)
 user_subject: dict[int, str] = {}
 user_last_req: dict[int, float] = {}
+
+# --- Статистика користувачів ---
+STATS_FILE = "stats.json"
+
+def load_stats() -> dict:
+    try:
+        with open(STATS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict) and isinstance(data.get("users"), dict):
+                return data
+    except Exception:
+        pass
+    return {"users": {}}
+
+def save_stats(data: dict):
+    try:
+        with open(STATS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        logger.warning(f"stats save failed: {e}")
+
+stats = load_stats()
+
+def log_user(m: Message, kind: str, subject: str = "", preview: str = "") -> bool:
+    """Записує користувача в stats.json. Повертає True, якщо користувач НОВИЙ."""
+    u = m.from_user
+    uid = str(u.id)
+    users = stats.setdefault("users", {})
+    is_new = uid not in users
+    entry = users.get(uid, {})
+    entry["name"] = u.full_name
+    entry["username"] = f"@{u.username}" if u.username else "—"
+    entry["requests"] = entry.get("requests", 0) + 1
+    entry[f"{kind}s"] = entry.get(f"{kind}s", 0) + 1
+    entry["last_seen"] = datetime.now(timezone.utc).strftime("%d.%m %H:%M")
+    if subject:
+        entry["last_subject"] = subject
+    if preview:
+        entry["last_task"] = preview[:80]
+    users[uid] = entry
+    save_stats(stats)
+    return is_new
+
+async def notify_admin(bot: Bot, m: Message):
+    """Сповіщення власнику про нового користувача."""
+    if ADMIN_ID and m.from_user.id != ADMIN_ID:
+        u = m.from_user
+        nick = f"@{u.username}" if u.username else "—"
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"👤 Новий користувач!\nІм'я: {u.full_name}\nНік: {nick}\nID: {u.id}"
+            )
+        except Exception as e:
+            logger.warning(f"admin notify failed: {e}")
 
 SYSTEM_PROMPT = (
     "Ти — добрий репетитор для учня 8 класу української школи (зараз 1-ша чверть). "
@@ -129,7 +187,7 @@ def build_prompt(task_text: str, subject: str) -> str:
     return f"{SYSTEM_PROMPT}\n\nПредмет: {subject}\nЗавдання: {task_text}"
 
 # --- AI: Gemini (основний, безкоштовний, новий SDK) ---
-GEMINI_FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-flash-latest"]
+GEMINI_FALLBACK_MODELS = ["gemini-2.0-flash", "gemini-flash-latest"]
 
 async def ask_gemini(prompt: str, image_bytes: bytes | None = None) -> str:
     """Повертає текст відповіді або кидає Exception. При перевантаженні (503) пробує запасні моделі."""
@@ -294,8 +352,10 @@ def check_spam(user_id: int) -> bool:
 dp = Dispatcher()
 
 @dp.message(CommandStart())
-async def cmd_start(m: Message):
+async def cmd_start(m: Message, bot: Bot):
     user_subject[m.from_user.id] = "📖 Інше"
+    if log_user(m, "start"):
+        await notify_admin(bot, m)
     await m.answer(
         "Привіт! Я бот-помічник з домашки 🇺🇦\n\n"
         "📝 Надішли завдання <b>текстом</b>\n"
@@ -313,6 +373,22 @@ async def cmd_help(m: Message):
         "Просто надішли текст або фото завдання 📚",
         reply_markup=subjects_keyboard(),
     )
+
+@dp.message(Command("stats"))
+async def cmd_stats(m: Message):
+    if not ADMIN_ID or m.from_user.id != ADMIN_ID:
+        await m.answer("⛔ Ця команда тільки для власника бота.")
+        return
+    users = stats.get("users", {})
+    total_req = sum(u.get("requests", 0) for u in users.values())
+    lines = [f"📊 Статистика: {len(users)} користувачів, {total_req} запитів"]
+    top = sorted(users.items(), key=lambda kv: kv[1].get("requests", 0), reverse=True)[:15]
+    for uid, u in top:
+        lines.append(
+            f"• {u.get('name')} ({u.get('username')}) — {u.get('requests')} зап., "
+            f"фото {u.get('photos', 0)}/текст {u.get('texts', 0)}, ост. {u.get('last_seen', '?')}"
+        )
+    await send_long(m, "\n".join(lines))
 
 @dp.message(Command("predmet"))
 async def cmd_subject(m: Message):
@@ -333,6 +409,8 @@ async def handle_photo(m: Message, bot: Bot):
         image_bytes = buf.getvalue()
 
         caption = m.caption or "Розв'яжи завдання на фото."
+        if log_user(m, "photo", subject, caption):
+            await notify_admin(bot, m)
         answer = await solve_homework(caption, subject, image_bytes)
         await send_long(m, answer)
     except Exception as e:
@@ -352,7 +430,7 @@ async def handle_voice(m: Message):
     )
 
 @dp.message(F.text)
-async def handle_text(m: Message):
+async def handle_text(m: Message, bot: Bot):
     # Вибір предмета кнопкою
     if m.text in SUBJECTS:
         user_subject[m.from_user.id] = m.text
@@ -370,6 +448,8 @@ async def handle_text(m: Message):
     subject = user_subject.get(m.from_user.id, "📖 Інше")
     status = await m.answer("🧠 Думаю над рішенням... ⏳")
     try:
+        if log_user(m, "text", subject, m.text):
+            await notify_admin(bot, m)
         answer = await solve_homework(m.text, subject)
         await send_long(m, answer)
     except Exception as e:
@@ -389,13 +469,14 @@ async def health_server():
     from aiohttp import web
 
     async def ok(request):
-        return web.json_response({"status": "ok"})
+        return web.Response(text="OK", status=200)
 
     app = web.Application()
-    app.router.add_get("/", ok)
-    app.router.add_get("/health", ok)
+    # GET + HEAD + все методы: Render шлёт HEAD, UptimeRobot — GET. Без HEAD будет 405 и Render снимет инстанс с ротации (no-server).
+    for path in ("/", "/health"):
+        app.router.add_route("*", path, ok)
     port = int(os.getenv("PORT", "10000"))
-    runner = web.AppRunner(app)
+    runner = web.AppRunner(app, access_log=logging.getLogger("aiohttp.access"))
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
@@ -410,8 +491,17 @@ async def main():
     bot = Bot(token=BOT_TOKEN)
     has_gemini = "yes" if GEMINI_API_KEY else "no (text only via Pollinations)"
     print(f"[OK] Bot zapushcheno! Gemini: {has_gemini}")
-    # поллінг Telegram + health-сервер одночасно (для Render Free)
-    await asyncio.gather(dp.start_polling(bot), health_server())
+    # поллінг Telegram + health-сервер одночасно (для Render Free).
+    # health крутиться фоном, чтобы падение polling не роняло HTTP (иначе Render даст no-server).
+    health_task = asyncio.create_task(health_server())
+    try:
+        await dp.start_polling(bot, drop_pending_updates=False)
+    finally:
+        health_task.cancel()
+        try:
+            await bot.session.close()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     asyncio.run(main())
