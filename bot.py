@@ -32,7 +32,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
 
 logging.basicConfig(level=logging.INFO)
@@ -236,7 +236,7 @@ async def ask_gemini(prompt: str, image_bytes: bytes | None = None) -> str:
     raise last_err or RuntimeError("gemini failed")
 
 # --- AI: Groq (быстрый, бесплатный ключ; только ТЕКСТ, фото не смотрит) ---
-GROQ_FALLBACK_MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+GROQ_FALLBACK_MODELS = ["openai/gpt-oss-20b", "openai/gpt-oss-120b"]
 
 async def ask_groq(prompt: str) -> str:
     """Текстовый вопрос через Groq (OpenAI-совместимый API). Обычно отвечает за секунды."""
