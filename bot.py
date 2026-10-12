@@ -189,6 +189,14 @@ def build_prompt(task_text: str, subject: str) -> str:
 # --- AI: Gemini (основний, безкоштовний, новий SDK) ---
 GEMINI_FALLBACK_MODELS = ["gemini-2.0-flash", "gemini-flash-latest"]
 
+def _gemini_retryable(err: Exception) -> bool:
+    """True — стоит повторить (перегрузка/таймаут). False — бессмысленно (нет модели, плохой ключ)."""
+    s = f"{type(err).__name__}: {err}".lower()
+    fatal_marks = ("404", "not_found", "not found", "invalid_argument", "invalid model", "api key", "permission", "unauthenticated")
+    if any(m in s for m in fatal_marks):
+        return False
+    return True
+
 async def ask_gemini(prompt: str, image_bytes: bytes | None = None) -> str:
     """Повертає текст відповіді або кидає Exception. При перевантаженні (503) пробує запасні моделі."""
     from google import genai
@@ -201,6 +209,7 @@ async def ask_gemini(prompt: str, image_bytes: bytes | None = None) -> str:
     models = [GEMINI_MODEL] + [m for m in GEMINI_FALLBACK_MODELS if m != GEMINI_MODEL]
     last_err: Exception | None = None
     for model_name in models:
+        t0 = time.time()
         for attempt in range(2):
             try:
                 if image_bytes:
@@ -217,12 +226,15 @@ async def ask_gemini(prompt: str, image_bytes: bytes | None = None) -> str:
                     )
                 text = (resp.text or "").strip()
                 if text:
+                    logger.info(f"Gemini {model_name} OK in {time.time() - t0:.1f}s")
                     return text
                 raise RuntimeError("empty response")
             except Exception as e:
                 last_err = e
-                logger.warning(f"Gemini {model_name} attempt {attempt + 1} failed: {e}")
-                await asyncio.sleep(2)
+                logger.warning(f"Gemini {model_name} attempt {attempt + 1} failed in {time.time() - t0:.1f}s: {e}")
+                if not _gemini_retryable(e):
+                    break  # неверная модель/ключ — не ждём, сразу следующая модель
+                await asyncio.sleep(1)
     raise last_err or RuntimeError("gemini failed")
 
 # --- AI: Pollinations (запасний, БЕЗ ключа, анонімно) ---
@@ -278,12 +290,15 @@ async def ask_pollinations_vision(prompt: str, image_bytes: bytes) -> str:
 
 async def solve_homework(task_text: str, subject: str, image_bytes: bytes | None = None) -> str:
     prompt = build_prompt(task_text, subject)
+    t_start = time.time()
     # 1. Пробуємо Gemini (краще бачить фото, з ретраями)
     if GEMINI_API_KEY:
         try:
-            return clean_for_telegram(await ask_gemini(prompt, image_bytes))
+            ans = clean_for_telegram(await ask_gemini(prompt, image_bytes))
+            logger.info(f"solve_homework via gemini in {time.time() - t_start:.1f}s")
+            return ans
         except Exception as e:
-            logger.warning(f"Gemini failed, fallback to pollinations: {e}")
+            logger.warning(f"Gemini failed in {time.time() - t_start:.1f}s, fallback to pollinations: {e}")
     # 2. Фото: запасний варіант — Pollinations Vision
     if image_bytes:
         if not GEMINI_API_KEY:
@@ -293,9 +308,11 @@ async def solve_homework(task_text: str, subject: str, image_bytes: bytes | None
                 "А поки — перепиши завдання ТЕКСТОМ, і я вирішу без ключа ✅"
             )
         try:
-            return clean_for_telegram(await ask_pollinations_vision(prompt, image_bytes))
+            ans = clean_for_telegram(await ask_pollinations_vision(prompt, image_bytes))
+            logger.info(f"solve_homework via pollinations-vision in {time.time() - t_start:.1f}s")
+            return ans
         except Exception as e:
-            logger.warning(f"Pollinations vision failed: {e}")
+            logger.warning(f"Pollinations vision failed in {time.time() - t_start:.1f}s: {e}")
             return (
                 "😢 Сервери ШІ зараз перевантажені, фото не прочиталось.\n\n"
                 "Спробуй так:\n"
@@ -303,7 +320,9 @@ async def solve_homework(task_text: str, subject: str, image_bytes: bytes | None
                 "2. Тримай телефон РІВНО, щоб текст був горизонтально, при хорошому світлі\n"
                 "3. Або перепиши завдання текстом — так точно вийде ✅"
             )
-    return clean_for_telegram(await ask_pollinations(prompt))
+    ans = clean_for_telegram(await ask_pollinations(prompt))
+    logger.info(f"solve_homework via pollinations in {time.time() - t_start:.1f}s")
+    return ans
 
 def format_html(text: str) -> str:
     """Робить відповідь читабельною: жирна відповідь і заголовки блоків. Безпечно для Telegram HTML."""
