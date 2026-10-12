@@ -31,6 +31,8 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
 
 logging.basicConfig(level=logging.INFO)
@@ -200,22 +202,28 @@ async def ask_gemini(prompt: str, image_bytes: bytes | None = None) -> str:
 
     models = [GEMINI_MODEL] + [m for m in GEMINI_FALLBACK_MODELS if m != GEMINI_MODEL]
     last_err: Exception | None = None
-    # По одной попытке на модель: при 503 вторая попытка редко помогает, а секунды тикают.
-    # Шансов и так три (2 модели + Pollinations ниже), поэтому не ждём и не повторяем.
+    # По одной попытке на модель + жёсткий таймаут: бесплатный Gemini иногда
+    # не падает с 503, а просто висит (видели OK in 132.8s). дольше 60с не ждём.
     for model_name in models:
         t0 = time.time()
         try:
             if image_bytes:
                 img_part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
-                resp = await client.aio.models.generate_content(
-                    model=model_name,
-                    contents=[img_part, prompt],
+                resp = await asyncio.wait_for(
+                    client.aio.models.generate_content(
+                        model=model_name,
+                        contents=[img_part, prompt],
+                    ),
+                    timeout=60,
                 )
             else:
-                resp = await client.aio.models.generate_content(
-                    model=model_name,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+                resp = await asyncio.wait_for(
+                    client.aio.models.generate_content(
+                        model=model_name,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+                    ),
+                    timeout=60,
                 )
             text = (resp.text or "").strip()
             if text:
@@ -226,6 +234,48 @@ async def ask_gemini(prompt: str, image_bytes: bytes | None = None) -> str:
             last_err = e
             logger.warning(f"Gemini {model_name} failed in {time.time() - t0:.1f}s: {e}")
     raise last_err or RuntimeError("gemini failed")
+
+# --- AI: Groq (быстрый, бесплатный ключ; только ТЕКСТ, фото не смотрит) ---
+GROQ_FALLBACK_MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+
+async def ask_groq(prompt: str) -> str:
+    """Текстовый вопрос через Groq (OpenAI-совместимый API). Обычно отвечает за секунды."""
+    if not GROQ_API_KEY:
+        raise RuntimeError("no groq key")
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+    models = [GROQ_MODEL] + [m for m in GROQ_FALLBACK_MODELS if m != GROQ_MODEL]
+    last_err: Exception | None = None
+    async with aiohttp.ClientSession() as session:
+        for model_name in models:
+            t0 = time.time()
+            payload = {
+                "model": model_name,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.7,
+                "max_tokens": 1500,
+            }
+            try:
+                async with session.post(
+                    url, headers=headers, json=payload,
+                    timeout=aiohttp.ClientTimeout(total=45),
+                ) as r:
+                    if r.status != 200:
+                        text = await r.text()
+                        raise RuntimeError(f"groq {model_name} {r.status}: {text[:200]}")
+                    data = await r.json()
+                    ans = data["choices"][0]["message"]["content"].strip()
+                    if ans:
+                        logger.info(f"Groq {model_name} OK in {time.time() - t0:.1f}s")
+                        return ans
+                    raise RuntimeError("empty response")
+            except Exception as e:
+                last_err = e
+                logger.warning(f"Groq {model_name} failed in {time.time() - t0:.1f}s: {e}")
+    raise last_err or RuntimeError("groq failed")
 
 # --- AI: Pollinations (запасний, БЕЗ ключа, анонімно) ---
 async def ask_pollinations(prompt: str) -> str:
@@ -281,6 +331,14 @@ async def ask_pollinations_vision(prompt: str, image_bytes: bytes) -> str:
 async def solve_homework(task_text: str, subject: str, image_bytes: bytes | None = None) -> str:
     prompt = build_prompt(task_text, subject)
     t_start = time.time()
+    # 0. ТЕКСТ: быстрый Groq (если есть ключ). Фото Groq не смотрит — для фото сразу к Gemini.
+    if not image_bytes and GROQ_API_KEY:
+        try:
+            ans = clean_for_telegram(await ask_groq(prompt))
+            logger.info(f"solve_homework via groq in {time.time() - t_start:.1f}s")
+            return ans
+        except Exception as e:
+            logger.warning(f"Groq failed in {time.time() - t_start:.1f}s, fallback to gemini: {e}")
     # 1. Пробуємо Gemini (краще бачить фото, з ретраями)
     if GEMINI_API_KEY:
         try:
@@ -499,7 +557,8 @@ async def main():
         return
     bot = Bot(token=BOT_TOKEN)
     has_gemini = "yes" if GEMINI_API_KEY else "no (text only via Pollinations)"
-    print(f"[OK] Bot zapushcheno! Gemini: {has_gemini}")
+    has_groq = "yes" if GROQ_API_KEY else "no"
+    print(f"[OK] Bot zapushcheno! Gemini: {has_gemini}, Groq: {has_groq}")
     # поллінг Telegram + health-сервер одночасно (для Render Free).
     # health крутиться фоном, чтобы падение polling не роняло HTTP (иначе Render даст no-server).
     health_task = asyncio.create_task(health_server())
