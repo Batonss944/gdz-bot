@@ -38,14 +38,17 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Предмети (8 клас, 1 чверть, НУШ Україна) ---
+# --- Предмети (8 клас, НУШ Україна) ---
 SUBJECTS = [
     "📐 Алгебра", "📏 Геометрія",
     "⚛️ Фізика", "🧪 Хімія",
-    "🌍 Географія", "🧬 Біологія",
+    "🔬 STEM", "🌍 Географія",
+    "🧬 Біологія", "💻 Інформатика",
     "🇺🇦 Історія України", "🏛️ Всесвітня історія",
-    "📚 Укр. мова", "🇬🇧 Англійська",
-    "📖 Інше",
+    "📚 Укр. мова", "📖 Укр. література",
+    "📜 Зарубіжна літ.", "🎨 Мистецтво",
+    "🇬🇧 Англійська", "🛡️ Здоров'я і безпека",
+    "📦 Інше",
 ]
 
 def subjects_keyboard() -> ReplyKeyboardMarkup:
@@ -236,8 +239,9 @@ async def ask_gemini(prompt: str, image_bytes: bytes | None = None) -> str:
             logger.warning(f"Gemini {model_name} failed in {time.time() - t0:.1f}s: {e}")
     raise last_err or RuntimeError("gemini failed")
 
-# --- AI: Groq (быстрый, бесплатный ключ; только ТЕКСТ, фото не смотрит) ---
+# --- AI: Groq (быстрый, бесплатный ключ; текст + фото через vision-модель) ---
 GROQ_FALLBACK_MODELS = ["openai/gpt-oss-20b", "openai/gpt-oss-120b"]
+GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.8-27b")
 
 async def ask_groq(prompt: str) -> str:
     """Текстовый вопрос через Groq (OpenAI-совместимый API). Обычно отвечает за секунды."""
@@ -278,6 +282,47 @@ async def ask_groq(prompt: str) -> str:
                 logger.warning(f"Groq {model_name} failed in {time.time() - t0:.1f}s: {e}")
     raise last_err or RuntimeError("groq failed")
 
+async def ask_groq_vision(prompt: str, image_bytes: bytes) -> str:
+    """Фото через Groq vision (OpenAI-совместимый формат с image_url)."""
+    import base64
+
+    if not GROQ_API_KEY:
+        raise RuntimeError("no groq key")
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+    data_url = f"data:image/jpeg;base64,{b64}"
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+    payload = {
+        "model": GROQ_VISION_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            },
+        ],
+        "temperature": 0.5,
+        "max_tokens": 2000,
+    }
+    t0 = time.time()
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            url, headers=headers, json=payload,
+            timeout=aiohttp.ClientTimeout(total=90),
+        ) as r:
+            if r.status != 200:
+                text = await r.text()
+                raise RuntimeError(f"groq vision {GROQ_VISION_MODEL} {r.status}: {text[:200]}")
+            data = await r.json()
+            ans = data["choices"][0]["message"]["content"].strip()
+            if ans:
+                logger.info(f"Groq vision {GROQ_VISION_MODEL} OK in {time.time() - t0:.1f}s")
+                return ans
+            raise RuntimeError("empty response")
+
 # --- AI: Pollinations (запасний, БЕЗ ключа, анонімно) ---
 async def ask_pollinations(prompt: str) -> str:
     """POST https://text.pollinations.ai/openai БЕЗ Authorization header."""
@@ -299,40 +344,10 @@ async def ask_pollinations(prompt: str) -> str:
             data = await r.json()
             return data["choices"][0]["message"]["content"].strip()
 
-async def ask_pollinations_vision(prompt: str, image_bytes: bytes) -> str:
-    """Запасне розпізнавання фото через Pollinations (без ключа, анонімно). Кидає Exception при невдачі."""
-    import base64
-
-    b64 = base64.b64encode(image_bytes).decode("ascii")
-    data_url = f"data:image/jpeg;base64,{b64}"
-    url = "https://text.pollinations.ai/openai"
-    payload = {
-        "model": "openai",
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": data_url}},
-                ],
-            },
-        ],
-        "temperature": 0.5,
-        "max_tokens": 2000,
-    }
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=120)) as r:
-            if r.status != 200:
-                text = await r.text()
-                raise RuntimeError(f"pollinations vision {r.status}: {text[:200]}")
-            data = await r.json()
-            return data["choices"][0]["message"]["content"].strip()
-
 async def solve_homework(task_text: str, subject: str, image_bytes: bytes | None = None) -> str:
     prompt = build_prompt(task_text, subject)
     t_start = time.time()
-    # 0. ТЕКСТ: быстрый Groq (если есть ключ). Фото Groq не смотрит — для фото сразу к Gemini.
+    # 0. ТЕКСТ: быстрый Groq (если есть ключ).
     if not image_bytes and GROQ_API_KEY:
         try:
             ans = clean_for_telegram(await ask_groq(prompt))
@@ -348,27 +363,37 @@ async def solve_homework(task_text: str, subject: str, image_bytes: bytes | None
             return ans
         except Exception as e:
             logger.warning(f"Gemini failed in {time.time() - t_start:.1f}s, fallback to pollinations: {e}")
-    # 2. Фото: запасний варіант — Pollinations Vision
+    # 2. Фото: Groq vision (швидко) -> Gemini vision (якісно). Pollinations vision
+    #    помер (legacy API повертає 400 deprecated), тому його тут більше нема.
     if image_bytes:
-        if not GEMINI_API_KEY:
+        if not GROQ_API_KEY and not GEMINI_API_KEY:
             return (
-                "📸 Я отримав фото, але для розпізнавання фото потрібен безкоштовний ключ Gemini.\n\n"
-                "👉 Отримай за 1 хв: https://aistudio.google.com → Get API Key → встав у .env як GEMINI_API_KEY\n\n"
+                "📸 Я отримав фото, але для розпізнавання фото потрібен безкоштовний ключ.\n\n"
+                "👉 Gemini: https://aistudio.google.com → Get API Key\n"
+                "👉 або Groq: https://console.groq.com → API Keys\n\n"
                 "А поки — перепиши завдання ТЕКСТОМ, і я вирішу без ключа ✅"
             )
-        try:
-            ans = clean_for_telegram(await ask_pollinations_vision(prompt, image_bytes))
-            logger.info(f"solve_homework via pollinations-vision in {time.time() - t_start:.1f}s")
-            return ans
-        except Exception as e:
-            logger.warning(f"Pollinations vision failed in {time.time() - t_start:.1f}s: {e}")
-            return (
-                "😢 Сервери ШІ зараз перевантажені, фото не прочиталось.\n\n"
-                "Спробуй так:\n"
-                "1. Зачекай 1 хвилину і надішли фото ще раз\n"
-                "2. Тримай телефон РІВНО, щоб текст був горизонтально, при хорошому світлі\n"
-                "3. Або перепиши завдання текстом — так точно вийде ✅"
-            )
+        if GROQ_API_KEY:
+            try:
+                ans = clean_for_telegram(await ask_groq_vision(prompt, image_bytes))
+                logger.info(f"solve_homework via groq-vision in {time.time() - t_start:.1f}s")
+                return ans
+            except Exception as e:
+                logger.warning(f"Groq vision failed in {time.time() - t_start:.1f}s: {e}")
+        if GEMINI_API_KEY:
+            try:
+                ans = clean_for_telegram(await ask_gemini(prompt, image_bytes))
+                logger.info(f"solve_homework via gemini in {time.time() - t_start:.1f}s")
+                return ans
+            except Exception as e:
+                logger.warning(f"Gemini vision failed in {time.time() - t_start:.1f}s: {e}")
+        return (
+            "😢 Сервери ШІ зараз перевантажені, фото не прочиталось.\n\n"
+            "Спробуй так:\n"
+            "1. Зачекай 1 хвилину і надішли фото ще раз\n"
+            "2. Тримай телефон РІВНО, щоб текст був горизонтально, при хорошому світлі\n"
+            "3. Або перепиши завдання текстом — так точно вийде ✅"
+        )
     ans = clean_for_telegram(await ask_pollinations(prompt))
     logger.info(f"solve_homework via pollinations in {time.time() - t_start:.1f}s")
     return ans
@@ -437,7 +462,7 @@ dp = Dispatcher()
 
 @dp.message(CommandStart())
 async def cmd_start(m: Message, bot: Bot):
-    user_subject[m.from_user.id] = "📖 Інше"
+    user_subject[m.from_user.id] = "📦 Інше"
     if log_user(m, "start"):
         await notify_admin(bot, m)
     await m.answer(
@@ -483,7 +508,7 @@ async def handle_photo(m: Message, bot: Bot):
     if not check_spam(m.from_user.id):
         await m.answer("⏳ Зачекай пару секунд і спробуй ще раз 🙏")
         return
-    subject = user_subject.get(m.from_user.id, "📖 Інше")
+    subject = user_subject.get(m.from_user.id, "📦 Інше")
     status = await m.answer("📸 Бачу фото, розпізнаю і вирішую... ⏳")
 
     try:
@@ -531,7 +556,7 @@ async def handle_text(m: Message, bot: Bot):
         await m.answer("Напиши завдання трохи детальніше 📝")
         return
 
-    subject = user_subject.get(m.from_user.id, "📖 Інше")
+    subject = user_subject.get(m.from_user.id, "📦 Інше")
     status = await m.answer("🧠 Думаю над рішенням... ⏳")
     try:
         if log_user(m, "text", subject, m.text):
