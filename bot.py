@@ -202,8 +202,9 @@ async def ask_gemini(prompt: str, image_bytes: bytes | None = None) -> str:
 
     models = [GEMINI_MODEL] + [m for m in GEMINI_FALLBACK_MODELS if m != GEMINI_MODEL]
     last_err: Exception | None = None
-    # По одной попытке на модель + жёсткий таймаут: бесплатный Gemini иногда
-    # не падает с 503, а просто висит (видели OK in 132.8s). дольше 60с не ждём.
+    # По одной попытке на модель + жёсткий таймаут. Фото тяжелее текста,
+    # поэтому vision даём 120с, тексту хватает 60с (видели зависание OK in 132.8s).
+    timeout = 120 if image_bytes else 60
     for model_name in models:
         t0 = time.time()
         try:
@@ -214,7 +215,7 @@ async def ask_gemini(prompt: str, image_bytes: bytes | None = None) -> str:
                         model=model_name,
                         contents=[img_part, prompt],
                     ),
-                    timeout=60,
+                    timeout=timeout,
                 )
             else:
                 resp = await asyncio.wait_for(
@@ -223,7 +224,7 @@ async def ask_gemini(prompt: str, image_bytes: bytes | None = None) -> str:
                         contents=prompt,
                         config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
                     ),
-                    timeout=60,
+                    timeout=timeout,
                 )
             text = (resp.text or "").strip()
             if text:
@@ -406,6 +407,22 @@ async def send_long(m: Message, text: str, limit: int = 4000):
             plain = html.unescape(re.sub(r"</?b>", "", ch))
             await m.answer(plain)
 
+def shrink_photo(image_bytes: bytes, max_side: int = 1568) -> bytes:
+    """Жмёт фото до max_side по длинной стороне в JPEG. Телефонные 3-5 МБ
+    превращаются в ~300-500 КБ: быстрее загрузка в ИИ и меньше отвалов."""
+    try:
+        from PIL import Image
+
+        img = Image.open(io.BytesIO(image_bytes))
+        if max(img.size) > max_side:
+            img.thumbnail((max_side, max_side), Image.LANCZOS)
+        out = io.BytesIO()
+        img.convert("RGB").save(out, format="JPEG", quality=82)
+        return out.getvalue()
+    except Exception as e:
+        logger.warning(f"shrink failed, sending original ({len(image_bytes)}b): {e}")
+        return image_bytes
+
 def check_spam(user_id: int) -> bool:
     """True = можна, False = занадто часто."""
     now = time.time()
@@ -473,7 +490,9 @@ async def handle_photo(m: Message, bot: Bot):
         photo = m.photo[-1]  # найбільший розмір
         buf = io.BytesIO()
         await bot.download(photo, destination=buf)
-        image_bytes = buf.getvalue()
+        raw_bytes = buf.getvalue()
+        image_bytes = shrink_photo(raw_bytes)
+        logger.info(f"photo {len(raw_bytes) // 1024}KB -> {len(image_bytes) // 1024}KB")
 
         caption = m.caption or "Розв'яжи завдання на фото."
         if log_user(m, "photo", subject, caption):
